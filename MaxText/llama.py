@@ -1,0 +1,857 @@
+#from aqt.jax import aqt_dot_general as aqt
+
+import dataclasses
+import functools
+import operator
+from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union, List
+
+from flax import linen as nn
+from flax.linen import partitioning as nn_partitioning
+
+import numpy as np
+
+import jax
+from jax import lax
+from jax import random
+from jax.ad_checkpoint import checkpoint_name
+import jax.numpy as jnp
+
+from dataclasses import dataclass
+from config import LlamaConfig
+
+from flax.linen.initializers import lecun_normal, normal
+
+aqt = None
+aqt_dot_general = None
+
+withLP = nn.with_logical_partitioning
+ScanIn = nn_partitioning.ScanIn
+
+Config = Any
+
+Array = jnp.ndarray
+DType = jnp.dtype
+PRNGKey = jnp.ndarray
+
+# Type annotations
+Array = jnp.ndarray
+DType = jnp.dtype
+PRNGKey = jnp.ndarray
+Shape = Iterable[int]
+Activation = Callable[..., Array]
+# Parameter initializers.
+Initializer = Callable[[PRNGKey, Shape, DType], Array]
+InitializerAxis = Union[int, Tuple[int, ...]]
+NdInitializer = Callable[
+    [PRNGKey, Shape, DType, InitializerAxis, InitializerAxis], Array]
+
+
+default_embed_init = nn.initializers.variance_scaling(
+    1.0, 'fan_in', 'normal', out_axis=0)
+
+
+#################### HELPER FUNCTIONS ####################
+
+llama_act_fn = jax.nn.silu
+
+@dataclass
+class LlamaOutput:
+    last_hidden_state: Array = None
+    past_key_values: Optional[Tuple[Tuple[Array]]] = None
+    hidden_states: Optional[Tuple[Array]] = None
+    attentions: Optional[Tuple[Array]] = None
+    cross_attentions: Optional[Tuple[Array]] = None
+
+@dataclass
+class CausalLlamaOutput:
+    loss: Optional[Array] = None
+    logits: Array = None
+    past_key_values: Optional[Tuple[Tuple[Array]]] = None
+    hidden_states: Optional[Tuple[Array]] = None
+    attentions: Optional[Tuple[Array]] = None
+    z_loss: Array = None
+    aux_loss: Array = None
+    router_logits: Optional[Tuple[Array]] = None
+
+
+def _canonicalize_tuple(x):
+  if isinstance(x, Iterable):
+    return tuple(x)
+  else:
+    return (x,)
+
+def _normalize_axes(axes: Iterable[int], ndim: int) -> Tuple[int]:
+  # A tuple by convention. len(axes_tuple) then also gives the rank efficiently.
+  return tuple(ax if ax >= 0 else ndim + ax for ax in axes)
+
+def nd_dense_init(scale, mode, distribution):
+  """Initializer with in_axis, out_axis set at call time."""
+  def init_fn(key, shape, dtype, in_axis, out_axis):
+    fn = jax.nn.initializers.variance_scaling(
+        scale, mode, distribution, in_axis, out_axis)
+    return fn(key, shape, dtype)
+  return init_fn
+
+
+class DenseGeneral(nn.Module):
+  """A linear transformation (without bias) with flexible axes.
+
+    Attributes:
+      features: tuple with numbers of output features.
+      axis: tuple with axes to apply the transformation on.
+      dtype: the dtype of the computation (default: float32).
+      kernel_init: initializer function for the weight matrix.
+  """
+  features: Union[Iterable[int], int]
+  config: Config
+  axis: Union[Iterable[int], int] = -1
+  dtype: DType = jnp.float32
+  kernel_init: NdInitializer = nd_dense_init(1.0, 'fan_in', 'truncated_normal')
+  kernel_axes: Tuple[str, ...] = ()
+
+  @nn.compact
+  def __call__(self, inputs: Array) -> Array:
+    """Applies a linear transformation to the inputs along multiple dimensions.
+
+    Args:
+      inputs: The nd-array to be transformed.
+
+    Returns:
+      The transformed input.
+    """
+    cfg = self.config
+    features = _canonicalize_tuple(self.features)
+    axis = _canonicalize_tuple(self.axis)
+
+    inputs = jnp.asarray(inputs, self.dtype)
+    axis = _normalize_axes(axis, inputs.ndim)
+
+    kernel_shape = tuple(inputs.shape[ax] for ax in axis) + features
+    kernel_in_axis = np.arange(len(axis))
+    kernel_out_axis = np.arange(len(axis), len(axis) + len(features))
+    kernel = self.param(
+        'kernel',
+        withLP(self.kernel_init, self.kernel_axes),
+        kernel_shape,
+        jnp.float32,
+        kernel_in_axis,
+        kernel_out_axis)
+    kernel = jnp.asarray(kernel, self.dtype)
+
+    contract_ind = tuple(range(0, len(axis)))
+
+    return lax.dot_general(inputs, kernel, ((axis, contract_ind), ((), ())))
+
+class Embed(nn.Module):
+  """A parameterized function from integers [0, n) to d-dimensional vectors.
+
+  Attributes:
+    num_embeddings: number of embeddings.
+    features: number of feature dimensions for each embedding.
+    dtype: the dtype of the embedding vectors (default: float32).
+    embedding_init: embedding initializer.
+  """
+  num_embeddings: int
+  features: int
+  cast_input_dtype: Optional[DType] = None
+  dtype: DType = jnp.float32
+  attend_dtype: Optional[DType] = None
+  embedding_init: Initializer = default_embed_init
+  embedding: Array = dataclasses.field(init=False)
+
+  def setup(self):
+    self.embedding = self.param(
+        'embedding',
+        withLP(self.embedding_init, ('vocab', 'embed')),
+        (self.num_embeddings, self.features),
+        jnp.float32)
+
+  def __call__(self, inputs: Array) -> Array:
+    """Embeds the inputs along the last dimension.
+
+    Args:
+      inputs: input data, all dimensions are considered batch dimensions.
+
+    Returns:
+      Output which is embedded input data.  The output shape follows the input,
+      with an additional `features` dimension appended.
+    """
+    if self.cast_input_dtype:
+      inputs = inputs.astype(self.cast_input_dtype)
+    if not jnp.issubdtype(inputs.dtype, jnp.integer):
+      raise ValueError('Input type must be an integer or unsigned integer.')
+    output = jnp.asarray(self.embedding, self.dtype)[inputs]
+    output = nn.with_logical_constraint(output, ('activation_batch', 'activation_length', 'activation_embed'))
+    return output
+
+  def attend(self, query: Array) -> Array:
+    """Attend over the embedding using a query array.
+
+    Args:
+      query: array with last dimension equal the feature depth `features` of the
+        embedding.
+
+    Returns:
+      An array with final dim `num_embeddings` corresponding to the batched
+      inner-product of the array of query vectors against each embedding.
+      Commonly used for weight-sharing between embeddings and logit transform
+      in NLP models.
+    """
+    dtype = self.attend_dtype if self.attend_dtype is not None else self.dtype
+    return jnp.dot(query, jnp.asarray(self.embedding, dtype).T)
+
+# Copied from transformers.models.bart.modeling_bart._make_causal_mask
+def _make_causal_mask(
+    input_ids_shape: Tuple, dtype, device=None, past_key_values_length: int = 0
+):
+    """
+    Make causal mask used for bi-directional self-attention.
+    """
+    bsz, tgt_len = input_ids_shape
+    mask = jnp.full((tgt_len, tgt_len), jnp.finfo(dtype).min, device=device)
+    mask_cond = jnp.arange(mask.size(-1), device=device)
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+    #mask = mask.to(dtype)
+
+    if past_key_values_length > 0:
+        mask = jnp.concatenate([jnp.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
+    return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+
+
+# Copied from transformers.models.bart.modeling_bart._expand_mask
+def _expand_mask(mask, dtype, tgt_len: Optional[int] = None):
+    """
+    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    """
+    bsz, src_len = mask.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+
+    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len)
+
+    inverted_mask = 1.0 - expanded_mask
+
+    return inverted_mask.masked_fill(inverted_mask.to(jnp.bool), jnp.finfo(dtype).min)
+
+class LlamaRMSNorm(nn.Module):
+    hidden_size: int = 69
+    eps: float = 1e-6
+    
+    @nn.compact
+    def __call__(self, hidden_states):
+
+        variance_epsilon = self.eps
+        hidden_size = self.hidden_size
+
+        def rsqrt(x: Array) -> Array:
+            return 1 / jnp.sqrt(x)
+
+        weight = self.param('weight', lambda rng, shape: jnp.zeros(hidden_size), (hidden_size,))
+
+        variance = jnp.power(hidden_states, 2)
+        variance = jnp.mean(variance, -1, keepdims=True)
+        hidden_states = hidden_states * rsqrt(variance + variance_epsilon)
+        return jnp.multiply(weight, hidden_states)
+
+class LlamaRotaryEmbedding(nn.Module):
+    dim: Array
+    max_position_embeddings: int = 2048
+    base: int = 10000
+    
+    @nn.compact
+    def __call__(self, x, seq_len):
+        
+        dim = self.dim
+        max_position_embeddings = self.max_position_embeddings
+        base = self.base
+        inv_freq = 1.0 / (self.base ** (jnp.float32(jnp.arange(0, self.dim, 2)) / self.dim))
+
+        max_seq_len_cached = seq_len
+        t = jnp.arange(max_seq_len_cached, dtype=jnp.float32)
+
+        freqs = jnp.einsum("i,j->ij", t, inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = jnp.concatenate((freqs, freqs), axis=-1)
+
+        emb_cos = jnp.cos(emb)[None, None, :, :]
+        emb_sin = jnp.sin(emb)[None, None, :, :]
+
+        return (
+            emb_cos[:, :, :seq_len, ...],
+            emb_sin[:, :, :seq_len, ...]
+        )
+
+        # who caaares
+        """
+
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings, inv_freq.device, dtype=jnp.float32
+        )
+        """ 
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return jnp.concatenate((-x2, x1), axis=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
+    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
+    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
+    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+    cos = jnp.expand_dims(cos[position_ids], axis=1)  # [bs, 1, seq_len, dim]
+    sin = jnp.expand_dims(sin[position_ids], axis=1)  # [bs, 1, seq_len, dim]
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def repeat_kv(hidden_states: Array, n_rep: int) -> Array:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = jnp.broadcast_to(hidden_states[:, :, None, :, :], (batch, num_key_value_heads, n_rep, slen, head_dim))
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+#################### LLAMA CLASSES FROM PYTORCH ####################
+
+
+# good
+class LlamaMLP(nn.Module):
+    config: LlamaConfig
+    @nn.compact
+    def __call__(self, inputs): 
+
+        config = self.config
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+
+        inputs  = nn.with_logical_constraint(inputs, ('activation_batch', 'activation_length', 'activation_hidden'))
+
+        #gate_proj = nn.Dense(intermediate_size, name='gate_proj', use_bias=False)
+        #up_proj = nn.Dense(intermediate_size, name='up_proj', use_bias=False)
+        #down_proj = nn.Dense(hidden_size, name='down_proj', use_bias=False)
+
+        if config.dtype == 'float32':
+
+            inputs  = nn.with_logical_constraint(inputs, ('activation_batch', 'activation_length', 'activation_intermediate'))
+            # todo convert to dot general
+            #gate_proj_output = gate_proj(inputs) 
+
+            gate_proj_output = DenseGeneral(
+              intermediate_size,
+              kernel_axes=('embed', 'mlp'),
+              name='gate_proj',
+              config=config)(
+                  inputs)
+
+            #up_proj_output = up_proj(gate_proj_output) 
+            up_proj_output = DenseGeneral(
+              intermediate_size,
+              kernel_axes=('embed', 'mlp'),
+              name='up_proj',
+              config=config)(
+                  inputs)
+
+            int_output = llama_act_fn(gate_proj_output * up_proj_output)
+
+            inputs  = nn.with_logical_constraint(inputs, ('activation_batch', 'activation_length', 'activation_intermediate'))
+            down_proj_output = DenseGeneral(
+              hidden_size,
+              kernel_axes=('mlp', 'embed'),
+              name='down_proj',
+              config=config)(
+                  up_proj_output)
+
+            #down_proj_output = down_proj(up_proj_output) 
+            inputs  = nn.with_logical_constraint(inputs, ('activation_batch', 'activation_length', 'activation_hidden'))
+
+            """
+            gate_proj_output = lax.dot_general(inputs, gate_proj, ((axis, contract_ind), ((), ())))
+            up_proj_output = lax.dot_general(gate_proj_output, up_proj, ((axis, contract_ind), ((), ())))
+            down_proj_output = lax.dot_general(up_proj_output, down_proj, ((axis, contract_ind), ((), ())))
+            """
+
+            return down_proj_output
+
+        else:
+            # do aqt quant
+            aqt_cfg = maxtext_sweeps.sweep1(cfg.fwd_int8, cfg.bwd_int8)
+            aqt_dot_general = aqt.make_dot_general(aqt_cfg)
+            aqt_key = self.make_rng('aqt')
+            context = aqt.Context(key=aqt_key, train_step=None)
+
+            gate_proj_output = aqt_dot_general(inputs, gate_proj, ((axis, contract_ind), ((), ())), context=context)
+            up_proj_output = aqt_dot_general(gate_proj_output, up_proj, ((axis, contract_ind), ((), ())), context=context)
+            down_proj_output = aqt_dot_general(up_proj_output, down_proj, ((axis, contract_ind), ((), ())), context=context)
+
+            return down_proj_output
+
+
+# todo
+class LlamaAttention(nn.Module):
+    config: LlamaConfig
+
+    @nn.compact
+    def __call__(self,
+        hidden_states: Array,
+        attention_mask: Optional[Array] = None,
+        position_ids: Optional[Array] = None,
+        past_key_value: Optional[Tuple[Array]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        ) -> Array:
+        config = self.config
+        hidden_size = config.hidden_size
+        num_heads = config.num_attention_heads
+        head_dim = hidden_size // num_heads
+        num_key_value_heads = config.num_key_value_heads
+        num_key_value_groups = num_heads // num_key_value_heads
+        max_position_embeddings = config.max_position_embeddings
+        rope_theta = config.rope_theta
+
+        #q_proj = nn.Dense(num_heads * head_dim, use_bias=False, name="q_proj")
+        #k_proj = nn.Dense(num_key_value_heads * head_dim, use_bias=False, name="k_proj")
+        #v_proj = nn.Dense(num_key_value_heads * head_dim, use_bias=False, name="v_proj")
+        #o_proj = nn.Dense(num_heads * head_dim, use_bias=False, name="o_proj")
+
+
+        projection = functools.partial(
+        DenseGeneral,
+        axis=-1,
+        #features=(self.num_heads, self.head_dim),
+        kernel_axes=('embed', 'heads'),
+        config=config)
+
+        #print(num_heads * head_dim)
+        #print(hidden_states.shape[-1])
+
+
+        q_proj = projection(num_heads * head_dim, name="q_proj")
+        k_proj = projection(num_key_value_heads * head_dim, name="k_proj")
+        v_proj = projection(num_key_value_heads * head_dim, name="v_proj")
+        o_proj = projection(num_heads * head_dim, name="o_proj")
+
+
+        rotary_emb = LlamaRotaryEmbedding(
+            head_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=rope_theta
+        )
+
+        if config.dtype == 'float32':
+            (bsz, q_len, _) = hidden_states.shape
+            
+            #hidden_states = nn.with_logical_constraint(hidden_states, ('activation_batch', 'activation_length', 'activation_hidden'))
+            # compute q, k, v states and reshape
+            query_states = q_proj(hidden_states)
+            #query_states = nn.with_logical_constraint(query_states, ('activation_batch', 'activation_length', 'activation_heads_full'))
+            key_states = k_proj(hidden_states)
+            #key_states = nn.with_logical_constraint(key_states, ('activation_batch', 'activation_length', 'activation_kv_full'))
+            value_states = v_proj(hidden_states)
+            #value_states = nn.with_logical_constraint(value_states, ('activation_batch', 'activation_length', 'activation_kv_full'))
+
+            query_states = query_states.reshape(bsz, q_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+            #query_states = nn.with_logical_constraint(query_states, ('activation_batch', 'activation_q_heads', 'activation_length', 'activation_hidden'))
+
+
+            key_states = key_states.reshape(bsz, q_len, num_key_value_heads, head_dim).transpose(0, 2, 1, 3)
+            #key_states = nn.with_logical_constraint(key_states, ('activation_batch', 'activation_heads', 'activation_length', 'activation_hidden'))
+
+            value_states = value_states.reshape(bsz, q_len, num_key_value_heads, head_dim).transpose(0, 2, 1, 3)
+            #value_states = nn.with_logical_constraint(value_states, ('activation_batch', 'activation_heads', 'activation_length', 'activation_hidden'))
+
+            # apply rotary embedding, NO CACHING (yet)
+            past_key_value = None
+
+            kv_seq_len = key_states.shape[-2]
+            cos, sin = rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+            # apply repeat kv (why? we have more query heads than kv heads. the hidden states go from 
+            # (batch, num_kv_heads, seqlen, d_model) to (batch, num_attention_heads, seqlen, d_model))
+            key_states = repeat_kv(key_states, num_key_value_groups)
+            value_states = repeat_kv(value_states, num_key_value_groups)
+            #key_states = nn.with_logical_constraint(key_states, ('activation_batch', 'activation_q_heads', 'activation_length', 'activation_hidden'))
+            #value_states = nn.with_logical_constraint(value_states, ('activation_batch', 'activation_q_heads', 'activation_length', 'activation_hidden'))
+            
+            # compute the QKT / sqrt(d_model)
+            # todo make this dot general
+
+            #attn_weights = lax.dot_general(query_states, key_states.transpose(0, 1, 3, 2)) / jnp.sqrt(self.head_dim)
+            attn_weights = jnp.matmul(query_states, key_states.transpose(0, 1, 3, 2)) / jnp.sqrt(head_dim)
+
+
+            # TODO attention mask here
+            
+            # compute the value matmul
+            attn_weights = nn.activation.softmax(attn_weights, axis=-1)
+            
+            # todo make this dot general
+            #attn_output = lax.dot_general(attn_weights, value_states)
+            attn_output = jnp.matmul(attn_weights, value_states)
+        
+            attn_output = attn_output.transpose(0, 2, 1, 3)
+            attn_output = attn_output.reshape(bsz, q_len, hidden_size)
+
+            # finally, compute the output proj
+            attn_output = o_proj(attn_output)
+
+            #attn_output= nn.with_logical_constraint(attn_output, ('activation_batch', 'activation_length', 'activation_hidden'))
+
+            return attn_output, attn_weights, None
+
+
+class LlamaDecoderLayer(nn.Module):
+    config: LlamaConfig
+
+    @nn.compact
+    def __call__(
+        self, 
+        hidden_states: Array,
+        attention_mask: Optional[Array] = None,
+        position_ids: Optional[Array] = None,
+        past_key_value: Optional[Tuple[Array]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False ) -> Tuple[Array, Optional[Tuple[Array, Array]]]:
+        
+        config = self.config 
+        residual = hidden_states
+        # apply input norm
+        hidden_states = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, name="input_layernorm")(hidden_states)
+        
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = LlamaAttention(config, name="self_attn")(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+        hidden_states = residual + hidden_states
+
+
+        # Fully Connected
+        residual = hidden_states
+        # apply post attn norm
+        hidden_states = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, name="post_attention_layernorm")(hidden_states)
+        hidden_states = LlamaMLP(config, name="mlp")(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (self_attn_weights,)
+
+        if use_cache:
+            outputs += (present_key_value,)
+
+        return outputs
+
+class LlamaModel(nn.Module):
+    """
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
+
+    Args:
+        config: LlamaConfig
+    """
+
+    config: LlamaConfig
+    
+    @nn.compact
+    def __call__(
+        self,
+        input_ids: Array,
+        attention_mask: Optional[Array] = None,
+        position_ids: Optional[Array] = None,
+        past_key_values: Optional[List[Array]] = None,
+        inputs_embeds: Optional[Array] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None) -> Union[Tuple, any]:
+        
+        config = self.config
+        padding_idx = config.pad_token_id
+        vocab_size = config.vocab_size
+        config = self.config
+        
+        # todo add back padding_idx for embed, this might actually mess with inference as well
+        embed_tokens = Embed(config.vocab_size, config.hidden_size, name="embed_tokens")
+        layers = [LlamaDecoderLayer(config, name=f"layers_{i}") for i in range(config.num_hidden_layers)]
+        norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, name="norm")
+        
+        gradient_checkpointing = False
+        # self.post_init()
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # retrieve input_ids and inputs_embeds
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
+        elif input_ids is not None:
+            batch_size, seq_length = input_ids.shape
+        elif inputs_embeds is not None:
+            batch_size, seq_length, _ = inputs_embeds.shape
+        else:
+            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+
+        seq_length_with_past = seq_length
+        past_key_values_length = 0
+
+        if past_key_values is not None:
+            past_key_values_length = past_key_values[0][0].shape[2]
+            seq_length_with_past = seq_length_with_past + past_key_values_length
+
+        if position_ids is None:
+            #device = input_ids.device if input_ids is not None else inputs_embeds.device
+            position_ids = jnp.arange(
+                past_key_values_length, seq_length + past_key_values_length
+            )
+
+            position_ids = jnp.expand_dims(position_ids, 0).reshape(-1, seq_length)
+            #position_ids = position_ids.expand_dims(0).view(-1, seq_length)
+        else:
+            position_ids = position_ids.reshape(-1, seq_length).long()
+        
+        input_ids = input_ids.astype(jnp.int8)
+
+        if inputs_embeds is None:
+            inputs_embeds = embed_tokens(input_ids)
+
+        # embed positions
+        if attention_mask is None:
+            attention_mask = jnp.ones(
+                (batch_size, seq_length_with_past), dtype=jnp.bool_
+            )
+        # todo figure out attention mask
+        #attention_mask = self._prepare_decoder_attention_mask(
+        #    attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
+        #)
+
+        hidden_states = inputs_embeds
+        # for now we dont do cache
+        use_cache = False
+
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        next_decoder_cache = () if use_cache else None
+
+        for idx, decoder_layer in enumerate(layers):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            past_key_value = past_key_values[idx] if past_key_values is not None else None
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
+
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        hidden_states = norm(hidden_states)
+
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        next_cache = next_decoder_cache if use_cache else None
+        if not return_dict:
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+
+        return LlamaOutput(
+            last_hidden_state=hidden_states,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+
+
+    # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
+    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
+        # create causal mask
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        combined_attention_mask = None
+        if input_shape[-1] > 1:
+            combined_attention_mask = _make_causal_mask(
+                input_shape,
+                inputs_embeds.dtype,
+                device=inputs_embeds.device,
+                past_key_values_length=past_key_values_length,
+            )
+
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
+                inputs_embeds.device
+            )
+            combined_attention_mask = (
+                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+            )
+
+        return combined_attention_mask
+
+class LlamaPreTrainedModel:
+    config_class = LlamaConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["LlamaDecoderLayer"]
+    _skip_keys_device_placement = "past_key_values"
+
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        if isinstance(module, LlamaModel):
+            module.gradient_checkpointing = value
+
+class LlamaForCausalLM(nn.Module):
+    config: LlamaConfig
+    
+    @nn.compact
+    def __call__(
+        self,
+        input_ids: Array = None,
+        attention_mask: Optional[Array] = None,
+        position_ids: Optional[Array] = None,
+        past_key_values: Optional[List[Array]] = None,
+        inputs_embeds: Optional[Array]= None,
+        labels: Optional[Array] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, CausalLlamaOutput]:
+
+        config = self.config
+
+        model = LlamaModel(config, name="model")
+        vocab_size = config.vocab_size
+        lm_head = DenseGeneral(config.vocab_size, kernel_axes=("embed", "vocab"), name='lm_head', config=config)
+
+        # Initialize weights and apply final processing
+        #self.post_init()
+        _tied_weights_keys = ["lm_head.weight"]
+
+
+        output_attentions = output_attentions if output_attentions is not None else config.output_attentions
+        output_hidden_states = ( output_hidden_states if output_hidden_states is not None else config.output_hidden_states)
+        return_dict = return_dict if return_dict is not None else config.use_return_dict
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs[0]
+        logits = lm_head(hidden_states)
+        logits = jax.numpy.float32(logits)
+
+        loss = None
+        """
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+        """
+        # todo implement loss
+        loss = 0.0
+        
+        # this has loss and logits instead of other stuff
+
+        return logits
+        """
+        return CausalLlamaOutput(
+            loss=loss,
+            logits=logits,
+            #past_key_values=outputs.past_key_values,
+            #hidden_states=outputs.hidden_states,
+            #attentions=outputs.attentions,
+        )
+        """
+        
+
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        if past_key_values:
+            input_ids = input_ids[:, -1:]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -1].unsqueeze(-1)
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+            )
+        return reordered_past
