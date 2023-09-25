@@ -67,12 +67,13 @@ def temperature_sample(prompt_inputs,
   # (batch, length) array containing prefix prompt tokens for sampling loop
   # as well as the generated output of newly sampled tokens.
   sequences0 = prompt_inputs
+
   # Sampling loop state is stored in a simple tuple.
-  sampling_loop_init_state = (i0, sequences0, token0, ended0, rng0)
+  sampling_loop_init_state = (i0, sequences0,  token0, ended0, rng0)
 
   def sampling_loop_cond_fn(state):
     """Sampling loop termination condition."""
-    (i, _, _, ended, _) = state
+    (i, _,  _, ended, _) = state
     # Have we reached max decoding length?
     not_at_end = i < max_decode_len
     # Have all sampled sequences reached an end marker?
@@ -81,11 +82,12 @@ def temperature_sample(prompt_inputs,
 
   def sampling_loop_body_fn(state):
     """Sampling loop state update."""
-    i, sequences, cur_token, ended, rng = state
+    i, sequences,  cur_token, ended, rng = state
     # Split RNG for sampling.
     rng1, rng2 = random.split(rng)
     # Call fast-decoder model on current tokens to get next-position logits.
-    logits = tokens_to_logits(cur_token)
+    logits = tokens_to_logits(sequences)[:, -1]
+
     # Sample next token from logits.
     # TODO: add top-p "nucleus" sampling option.
     if topk:
@@ -116,7 +118,8 @@ def temperature_sample(prompt_inputs,
                                sampling_loop_body_fn,
                                sampling_loop_init_state)
 
+  tokens_to_logits(prompt_inputs)
+
   # Pick part of the state corresponding to the sampled sequences.
   final_sequences = final_state[1]
   return final_sequences
-

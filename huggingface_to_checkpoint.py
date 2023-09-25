@@ -37,54 +37,53 @@ for k, v in state_dict.items():
 
 # get lm head
 pytree['lm_head'] = {}
-pytree['lm_head']['kernel'] = state_dict['lm_head.weight']
+pytree['lm_head']['kernel'] = state_dict['lm_head.weight'].to(torch.float32).T.numpy()
 
 pytree['model'] = {}
 pytree['model']['embed_tokens'] = {}
-pytree['model']['embed_tokens']['embedding'] = state_dict['model.embed_tokens.weight']
+pytree['model']['embed_tokens']['embedding'] = state_dict['model.embed_tokens.weight'].to(torch.float32).numpy()
 
 pytree['model']['norm'] = {}
-pytree['model']['norm']['weight'] = state_dict['model.norm.weight']
+pytree['model']['norm']['weight'] = state_dict['model.norm.weight'].to(torch.float32).numpy()
 
 
 for i in range(32):
     
     pytree['model'][f'layers_{i}'] = {}
-    pytree['model'][f'layers_{i}']['input_layernorm'] = state_dict[f'model.layers.{i}.input_layernorm.weight']
+    pytree['model'][f'layers_{i}']['input_layernorm'] = state_dict[f'model.layers.{i}.input_layernorm.weight'].to(torch.float32).numpy()
 
-    pytree['model'][f'layers_{i}']['post_attention_layernorm'] = state_dict[f'model.layers.{i}.post_attention_layernorm.weight']
+    pytree['model'][f'layers_{i}']['post_attention_layernorm'] = state_dict[f'model.layers.{i}.post_attention_layernorm.weight'].to(torch.float32).numpy()
     pytree['model'][f'layers_{i}']['self_attn'] = {}
     pytree['model'][f'layers_{i}']['self_attn']['q_proj'] = {}
-    pytree['model'][f'layers_{i}']['self_attn']['q_proj']['kernel'] = state_dict[f'model.layers.{i}.self_attn.q_proj.weight']
+    pytree['model'][f'layers_{i}']['self_attn']['q_proj']['kernel'] = state_dict[f'model.layers.{i}.self_attn.q_proj.weight'].T.to(torch.float32).numpy()
     pytree['model'][f'layers_{i}']['self_attn']['k_proj'] = {}
-    pytree['model'][f'layers_{i}']['self_attn']['k_proj']['kernel'] = state_dict[f'model.layers.{i}.self_attn.k_proj.weight']
+    pytree['model'][f'layers_{i}']['self_attn']['k_proj']['kernel'] = state_dict[f'model.layers.{i}.self_attn.k_proj.weight'].T.to(torch.float32).numpy()
     pytree['model'][f'layers_{i}']['self_attn']['v_proj'] = {}
-    pytree['model'][f'layers_{i}']['self_attn']['v_proj']['kernel'] = state_dict[f'model.layers.{i}.self_attn.v_proj.weight']
+    pytree['model'][f'layers_{i}']['self_attn']['v_proj']['kernel'] = state_dict[f'model.layers.{i}.self_attn.v_proj.weight'].T.to(torch.float32).numpy()
     pytree['model'][f'layers_{i}']['self_attn']['o_proj'] = {}
-    pytree['model'][f'layers_{i}']['self_attn']['o_proj']['kernel'] = state_dict[f'model.layers.{i}.self_attn.o_proj.weight']
+    pytree['model'][f'layers_{i}']['self_attn']['o_proj']['kernel'] = state_dict[f'model.layers.{i}.self_attn.o_proj.weight'].T.to(torch.float32).numpy()
 
     pytree['model'][f'layers_{i}']['mlp'] = {}
     pytree['model'][f'layers_{i}']['mlp']['gate_proj'] = {}
-    pytree['model'][f'layers_{i}']['mlp']['gate_proj']['kernel'] = state_dict[f'model.layers.{i}.mlp.gate_proj.weight']
+    pytree['model'][f'layers_{i}']['mlp']['gate_proj']['kernel'] = state_dict[f'model.layers.{i}.mlp.gate_proj.weight'].T.to(torch.float32).numpy()
 
     pytree['model'][f'layers_{i}']['mlp']['up_proj'] = {}
-    pytree['model'][f'layers_{i}']['mlp']['up_proj']['kernel'] = state_dict[f'model.layers.{i}.mlp.up_proj.weight']
+    pytree['model'][f'layers_{i}']['mlp']['up_proj']['kernel'] = state_dict[f'model.layers.{i}.mlp.up_proj.weight'].T.to(torch.float32).numpy()
 
     pytree['model'][f'layers_{i}']['mlp']['down_proj'] = {}
-    pytree['model'][f'layers_{i}']['mlp']['down_proj']['kernel'] = state_dict[f'model.layers.{i}.mlp.down_proj.weight']
+    pytree['model'][f'layers_{i}']['mlp']['down_proj']['kernel'] = state_dict[f'model.layers.{i}.mlp.down_proj.weight'].T.to(torch.float32).numpy()
 
 
 path = 'hermes'
 
-# checkpointer = ocp.PyTreeCheckpointer()
+print(pytree)
+
+checkpointer = ocp.PyTreeCheckpointer()
 # 'checkpoint_name' must not already exist.
-# checkpointer.save(path, {'step': {}, 'params': pytree, 'count': {}})
+checkpointer.save(path, {'step': {}, 'params': pytree, 'count': {}})
 
-train_state.TrainState.create(
-    apply_fn= None,
-    params=variables['params'],
-    tx=tx)
 
+#train_state.TrainState.create(params=pytree)
 
 print('saved')
 
