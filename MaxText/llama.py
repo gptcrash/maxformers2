@@ -228,10 +228,14 @@ def _make_causal_mask(
     # this is poor code and only works for bs=1
     bsz, tgt_len = input_ids_shape
 
-    mask = jnp.tril(jnp.ones((1, 1, tgt_len, tgt_len)))
-    mask = masked_fill(mask, mask == 1, jnp.finfo(dtype).min)
+    mask = jnp.triu(jnp.ones((1, 1, tgt_len, tgt_len)), k=1) * jnp.finfo(dtype).min
 
-    return jnp.broadcast_to(mask, (bsz, 1, tgt_len, tgt_len))
+    return mask
+
+    #mask = jnp.triu(jnp.ones((1, 1, tgt_len, tgt_len)), k=1)
+    #mask = masked_fill(mask, mask == 1, jnp.finfo(dtype).min)
+
+    #return jnp.broadcast_to(mask, (bsz, 1, tgt_len, tgt_len))
 
     #mask_out = mask[None, None, :, :]
     #return jnp.broadcast_to(mask_out, (bsz, 1, tgt_len, tgt_len + past_key_values_length))
@@ -536,7 +540,7 @@ class LlamaAttention(nn.Module):
             jax.debug.print('attn weights before mask: {}', attn_weights)
 
             attn_weights = attn_weights + attention_mask
-            attn_weights += attention_mask 
+            #attn_weights += attention_mask 
 
             jax.debug.print('attn weights after mask: {}', attn_weights)
 

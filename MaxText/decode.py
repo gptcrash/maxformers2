@@ -259,7 +259,7 @@ def decode_loop(config, state=None):
     local_metrics_file = open(config.metrics_file, 'a', encoding="utf8")
     metrics= {'scalar': {} }
   #max_utils.activate_profiler(config)
-  for step in np.arange(1):
+  for step in np.arange(20):
     rng, rng_to_use = jax.random.split(rng)
     with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
       seqs = p_predict_step(tokenized_prompts, state, rng_to_use)
